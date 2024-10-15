@@ -679,7 +679,254 @@ class DynamiCrafterI2V:
                 video = F.interpolate(video.permute(0, 3, 1, 2), size=(final_H, final_W), mode="bicubic").permute(0, 2, 3, 1)
             last_image = video[-1].unsqueeze(0)
             return (video, last_image)
+    
+
+class DynamiCrafterInterpMultiImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "model": ("DCMODEL",),
+            "clip_vision": ("CLIP_VISION", ),
+            "positive": ("CONDITIONING", ),
+            "negative": ("CONDITIONING", ),
+            "images": ("IMAGE",),
+            "steps": ("INT", {"default": 50, "min": 1, "max": 200, "step": 1}),
+            "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 20.0, "step": 0.01}),
+            "eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "frames": ("INT", {"default": 16, "min": 1, "max": 100, "step": 1}),
+            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            "fs": ("INT", {"default": 10, "min": 2, "max": 100, "step": 1}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            "vae_dtype": (
+                    [
+                        'fp32',
+                        'fp16',
+                        'bf16',
+                        'auto'
+                    ], {
+                        "default": 'auto'
+                    }),
+            
+            },
+            "optional": {
+                "mask": ("MASK",),
+                "frame_window_size": ("INT", {"default": 16, "min": 1, "max": 200, "step": 1}),
+                "frame_window_stride": ("INT", {"default": 4, "min": 1, "max": 200, "step": 1}),
+                "augmentation_level": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.0001}),
+                "init_noise": ("DCNOISE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE",)
+    RETURN_NAMES = ("images", "last_image",)
+    FUNCTION = "process"
+    CATEGORY = "DynamiCrafterWrapper"
+
+    def process(self, model, images, clip_vision, positive, negative, cfg, steps, eta, seed, fs, keep_model_loaded, 
+                frames, vae_dtype, frame_window_size=16, frame_window_stride=4, mask=None, augmentation_level=0, init_noise=None):
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+
+        self.model = model['model']
+
+        torch.manual_seed(seed)
+        dtype = self.model.dtype
+        if vae_dtype == "auto":
+            try:
+                if mm.should_use_bf16():
+                    self.model.first_stage_model.to(convert_dtype('bf16'))
+                else:
+                    self.model.first_stage_model.to(convert_dtype('fp32'))
+            except:
+                raise AttributeError("ComfyUI version too old, can't autodetect properly. Set your dtype manually.")
+        else:
+            self.model.first_stage_model.to(convert_dtype(vae_dtype))
+        print(f"VAE using dtype: {self.model.first_stage_model.dtype}")
+
         
+        self.model.to(device)
+        autocast_condition = (dtype != torch.float32) and not comfy.model_management.is_device_mps(device)
+
+        all_videos = []
+        for i in range(len(images) - 1):
+            image = images[i].unsqueeze(0)
+            image2 = images[i + 1].unsqueeze(0)
+
+            with torch.autocast(comfy.model_management.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
+                
+                image = image.permute(0, 3, 1, 2).to(dtype).to(device)
+                if augmentation_level > 0:
+                    image += torch.randn_like(image) * augmentation_level
+
+                B, C, H, W = image.shape
+                orig_H, orig_W = H, W
+                if W % 64 != 0:
+                    W = W - (W % 64)
+                if H % 64 != 0:
+                    H = H - (H % 64)
+                if orig_H % 64 != 0 or orig_W % 64 != 0:
+                    image = F.interpolate(image, size=(H, W), mode="bilinear")
+            
+                B, C, H, W = image.shape
+                noise_shape = [B, self.model.model.diffusion_model.out_channels, frames, H // 8, W // 8]
+
+                self.model.first_stage_model.to(device)
+                encode_pixels = image.unsqueeze(2) * 2 - 1
+                z = get_latent_z(self.model, encode_pixels) #bc,1,hw
+
+                if image2 is not None:
+                    image2 = image2.permute(0, 3, 1, 2).to(dtype).to(device)
+
+                    if augmentation_level > 0:
+                        image2 += torch.randn_like(image2) * augmentation_level
+
+                    if image2.shape != image.shape:
+                        image2 = F.interpolate(image, size=(H, W), mode="bilinear")
+
+                    encode_pixels = image2.unsqueeze(2) * 2 - 1
+                    z2 = get_latent_z(self.model, encode_pixels) #bc,1,hw
+                    img_tensor_repeat = repeat(z, 'b c t h w -> b c (repeat t) h w', repeat=frames)
+                    img_tensor_repeat = torch.zeros_like(img_tensor_repeat)
+                    img_tensor_repeat[:,:,:1,:,:] = z
+                    img_tensor_repeat[:,:,-1:,:,:] = z2
+                else:
+                    img_tensor_repeat = repeat(z, 'b c t h w -> b c (repeat t) h w', repeat=frames)
+
+                self.model.first_stage_model.to(offload_device)
+        
+                self.model.image_proj_model.to(device)
+                text_emb = positive[0][0].to(device)
+
+                cond_images = clip_vision.encode_image(image.permute(0, 2, 3, 1).float())['last_hidden_state'].to(device)
+
+                img_emb = self.model.image_proj_model(cond_images)
+
+                imtext_cond = torch.cat([text_emb, img_emb], dim=1)
+                del cond_images, img_emb, text_emb, encode_pixels
+
+                fs = torch.tensor([fs], dtype=torch.long, device=self.model.device)
+                cond = {"c_crossattn": [imtext_cond], "c_concat": [img_tensor_repeat], "control_cond": None}
+
+                self.model.control_model = None
+
+                if noise_shape[-1] == 32:
+                    timestep_spacing = "uniform"
+                    guidance_rescale = 0.0
+                else:
+                    timestep_spacing = "uniform_trailing"
+                    guidance_rescale = 0.7
+
+                ## construct unconditional guidance
+                if cfg != 1.0: 
+                    uc_emb = negative[0][0].to(device)
+                    ## process image embedding token
+                    if hasattr(self.model, 'embedder'):
+                        uc_img = torch.rand(noise_shape[0],3,224,224).to(self.model.device)
+                        ## img: b c h w >> b l c
+                        uc_img = clip_vision.encode_image(uc_img.permute(0, 2, 3, 1).float())['last_hidden_state'].to(self.model.device)
+                        uc_img = self.model.image_proj_model(uc_img)
+                        uc_emb = torch.cat([uc_emb, uc_img], dim=1)
+                    if isinstance(cond, dict):
+                        uc = {key:cond[key] for key in cond.keys()}
+                        uc.update({'c_crossattn': [uc_emb]})
+                    else:
+                        uc = uc_emb
+                else:
+                    uc = None
+
+                self.model.image_proj_model.to(offload_device)
+
+                if mask is not None:     
+                    mask = mask.to(dtype).to(device)
+                    mask = F.interpolate(mask.unsqueeze(0), size=(H // 8, W // 8), mode="nearest").squeeze(0)
+                    mask = (1 - mask)
+                    mask = mask.unsqueeze(1)
+                    B, C, H, W = mask.shape
+                    if B < frames:
+                        mask = mask.unsqueeze(2)
+                        mask = mask.expand(-1, -1, frames, -1, -1)
+                    else:
+                        mask = mask.unsqueeze(0)
+                        mask = mask.permute(0, 2, 1, 3, 4) 
+                    mask = torch.where(mask < 1.0, torch.tensor(0.0, device=device, dtype=dtype), torch.tensor(1.0, device=device, dtype=dtype))
+
+                if init_noise is not None:
+                    if init_noise['analytic_init']:
+                        eps=torch.randn_like(init_noise['mu_p'])
+                        sigma_p = init_noise['sigma_p']
+                        init = (init_noise['mu_p'] + sigma_p*eps).to(dtype).to(device)
+                        if noise_shape[2] % init.shape[2] == 0:
+                            init = init.repeat(1, 1, noise_shape[2] // init.shape[2], 1, 1)
+                        else:
+                            raise ValueError("The target dimension size is not an integral multiple of the original dimension size.")
+                    else:
+                        init = None
+                    timestep_spacing = "uniform_trailing"
+                    guidance_rescale = 0.7
+                    ddpm_from = init_noise['M']
+                    
+                
+                else:
+                    init = None
+                    ddpm_from = 1000
+
+                #inference
+                ddim_sampler = DDIMSampler(self.model)
+                samples, _ = ddim_sampler.sample(
+                                                S=steps,
+                                                conditioning=cond,
+                                                batch_size=noise_shape[0],
+                                                shape=noise_shape[1:],
+                                                verbose=True,
+                                                unconditional_guidance_scale=cfg,
+                                                unconditional_conditioning=uc,
+                                                eta=eta,
+                                                temporal_length=noise_shape[2],
+                                                conditional_guidance_scale_temporal=None,
+                                                x_T=init,
+                                                fs=fs,
+                                                timestep_spacing=timestep_spacing,
+                                                guidance_rescale=guidance_rescale,
+                                                clean_cond=True,
+                                                mask=mask,
+                                                x0=img_tensor_repeat.clone() if mask is not None else None,
+                                                frame_window_size = frame_window_size,
+                                                frame_window_stride = frame_window_stride,
+                                                ddpm_from=ddpm_from
+                                                )
+                
+                assert not torch.isnan(samples).any().item(), "Resulting tensor containts NaNs. I'm unsure why this happens, changing step count and/or image dimensions might help."
+                
+                ## reconstruct from latent to pixel space
+                self.model.first_stage_model.to(device)
+                self.model.en_and_decode_n_samples_a_time = 1
+                decoded_images = self.model.decode_first_stage(samples) #b c t h w
+                self.model.first_stage_model.to(offload_device)
+            
+                video = decoded_images.detach().cpu()
+                video = torch.clamp(video.float(), -1., 1.)
+                video = (video + 1.0) / 2.0
+                video = video.squeeze(0).permute(1, 2, 3, 0)
+                del decoded_images, samples
+
+                if not keep_model_loaded:
+                    self.model.to(offload_device)
+                    mm.soft_empty_cache()
+                # Ensure the final dimensions are divisible by 2
+                final_H = (orig_H // 2) * 2
+                final_W = (orig_W // 2) * 2
+
+                if video.shape[1] != final_H or video.shape[2] != final_W:
+                    video = F.interpolate(video.permute(0, 3, 1, 2), size=(final_H, final_W), mode="bicubic").permute(0, 2, 3, 1)
+                all_videos.append(video)
+            
+        combined_video = torch.cat(all_videos, dim=0)
+        last_image = combined_video[-1].unsqueeze(0)
+    
+        return (combined_video, last_image)
+    
 class DynamiCrafterLoadInitNoise:
     @classmethod
     def INPUT_TYPES(s):
@@ -1299,7 +1546,8 @@ NODE_CLASS_MAPPINGS = {
     "DynamiCrafterLoadInitNoise": DynamiCrafterLoadInitNoise,
     "DownloadAndLoadDynamiCrafterCNModel": DownloadAndLoadDynamiCrafterCNModel,
     "DynamiCrafterControlnetApply": DynamiCrafterControlnetApply,
-    "DynamiCrafterCNLoader": DynamiCrafterCNLoader
+    "DynamiCrafterCNLoader": DynamiCrafterCNLoader,
+    "DynamiCrafterInterpMultiImage": DynamiCrafterInterpMultiImage
 
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1314,5 +1562,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DynamiCrafterLoadInitNoise": "DynamiCrafter LoadInitNoise",
     "DownloadAndLoadDynamiCrafterCNModel": "(Down)Load DynamiCrafter CNModel",
     "DynamiCrafterControlnetApply": "DynamiCrafter ControlnetApply",
-    "DynamiCrafterCNLoader": "DynamiCrafter CNLoader"
+    "DynamiCrafterCNLoader": "DynamiCrafter CNLoader",
+    "DynamiCrafterInterpMultiImage": "DynamiCrafter InterpMultiImage"
 }
